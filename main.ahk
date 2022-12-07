@@ -8,19 +8,12 @@ SetWorkingDir, "%A_ScriptDir%"
 #Include LibCon.ahk
 
 global hwnd_main := 0
-global WM_NULL := 0x0000
-global lp_process_ui_callback := RegisterCallback("process_ui_callback")
-global lp_recevie_message := RegisterCallback("recevie_message")
-global hThread := 0
-global msg
-global exit_flag := 0
-
-global dealer
 global jsonrpc_client
+global send_message_queue := []
 
 SmartStartConsole()
 
-recevie_message() {
+start() {
 
     zmq := new ZeroMQ
 
@@ -31,21 +24,20 @@ recevie_message() {
     ; dealer.setsockopt_string(zmq.CURVE_PUBLICKEY, "YHtx0zuc(ZkWoXaozP*JP+Kg<!#Dt.2S>oNUXn?Y", "utf-8")
     ; dealer.setsockopt_string(zmq.CURVE_SECRETKEY, "{r]PaKZ%WD.q$VAk=E5jMeFkMkSep.Lk]voT/db+", "utf-8")
 
-    dealer.connect("tcp://192.168.79.129:5003")
-
-    jsonrpc_client := new JSONRPCClient(dealer)
-
-    poller := zmq.poller([[dealer, zmq.POLLIN]])
+    dealer.connect("tcp://192.168.79.129:5004")
+    jsonrpc_client := new JSONRPCClient()
+    poller := zmq.poller([[dealer, zmq.POLLIN | zmq.POLLOUT]])
 
     loop
     {
 
-        if (exit_flag == 1)
-            break
+        nin := poller.poll(events, 100)
 
-        socks := poller.poll()
+        if (!nin) {
+            continue
+        }
 
-        if (socks[1]) {
+        if (events[1] & zmq.POLLIN == zmq.POLLIN) {
 
             msg := dealer.recv_string(zmq.DONTWAIT, "utf-8", false)
             if (msg is integer && msg < 0) {
@@ -55,28 +47,30 @@ recevie_message() {
                     continue
             }
 
-            SendMessage, WM_NULL, Object(msg), lp_process_ui_callback, , ahk_id %hwnd_main%
+            loop % msg.Length() {
+
+                parsed := JSON.Load(msg[A_Index])
+                key := "jsonrpc_" . parsed.id
+
+                reply := jsonrpc_client.replies[key]
+                if (replay.callback != 0)
+                    reply.callback.Call(parsed)
+                jsonrpc_client.replies.Remove(key)
+            }
+
+        }
+
+        if (events[1] & zmq.POLLOUT == zmq.POLLOUT) {
+
+            if (send_message_queue.Length() > 0) {
+                payload := send_message_queue.RemoveAt(1)
+
+                dealer.send_string(payload, ZMQ.DONTWAIT, "utf-8")
+            }
 
         }
 
     }
-
-}
-
-process_ui_callback(object_address)
-{
-
-    msg := Object(object_address)
-
-    loop % msg.Length() {
-
-        parsed := JSON.Load(msg[A_Index])
-        reply := jsonrpc_client.replies[parsed.id]
-        reply.callback.Call(parsed)
-        jsonrpc_client.replies.Remove(parsed.id)
-    }
-
-    ObjRelease(object_address)
 
 }
 
@@ -87,35 +81,17 @@ Gui, Add, Button, gCallJsonrpc, call jsonrpc
 Gui, Add, Button, gGoButton, Exit
 Gui, Show, w1200 h100, JsonRPC Over ahkzmp
 
-OnMessage(WM_NULL, "ON_WM_NULL")
-
-GoSub, Start
-
-return
-
-ON_WM_NULL(wParam, lParam)
-{
-    if (lParam != 0 && wParam != 0) {
-
-        DllCall(lParam, "Ptr", wParam)
-
-    }
-
-}
-
-Start:
-    if (!hThread)
-        hThread := DllCall("CreateThread", Ptr, 0, Ptr, 0, Ptr, lp_recevie_message, Ptr, 0, UInt, 0, Ptr, 0)
+start()
 
 return
 
 CallJsonrpc:
 
-    loop, 100 {
-        puts("-------------------------------------------")
-        reply := jsonrpc_client.Send("hello", [42, 23], Func("test1"))
-        ; 必须 Sleep，发送太快会崩
-        Sleep, 10
+    ; 大于10w 就大于 jsonrpc 自增 id 65535
+    loop, 10000 {
+        reply := jsonrpc_client.Send("hello", [42, 23])
+        ; 绑定一个回调方法
+        reply.callback := Func("test1")
     }
 
 return
@@ -127,11 +103,6 @@ test1(result) {
 }
 
 GoButton:
-    exit_flag := 1
-    DllCall("WaitForSingleObject", "PTR", hThread, "UInt", 0xFFFFFFFF)
-    DllCall("CloseHandle", "PTR", hThread)
-
-    DllCall("DeleteCriticalSection","Ptr", RTL_CRITICAL_SECTION)
 
 ExitApp
 return
@@ -140,7 +111,7 @@ return
 
 class Reply
 {
-    __New(messageid, body, callback) {
+    __New(messageid, body, callback := 0) {
         this.messageid := messageid
         this.body := body
         this.callback := callback
@@ -150,39 +121,57 @@ class Reply
 
 class JSONRPCClient
 {
-    __New(sock) {
-        this.sock := sock
+    __New() {
+
         this.replies := {}
         this.uniqueid := 0
 
     }
 
-    Send(method, params, callback) {
+    Send(method, params) {
 
         parsed := JSON.Load("{}")
         parsed.jsonrpc := "2.0"
         parsed.id := ++this.uniqueid
+        ;parsed.id := uuid()
         parsed.method := method
         parsed.params := params
 
         payload := JSON.Dump(parsed)
 
-        reply := new Reply(parsed.id, payload, callback)
-        this.replies.Insert(parsed.id, reply)
+        reply := new Reply(parsed.id, payload)
+
+        key := "jsonrpc_" . parsed.id
+        this.replies.Insert(key, reply)
 
         puts(payload)
 
-        loop {
-            rc := this.sock.send_string(payload, ZMQ.SNDMORE, "utf-8")
-            if (ret is integer && ret < 0) {
-                if (this.sock.errno() == ZMQ.EINTR)
-                    continue
-            }
-            puts(this.sock.errno())
-            break
-        }
+        send_message_queue.Push(payload)
+
+        ;rc := dealer.send_string(payload, ZMQ.DONTWAIT, "utf-8")
 
         return reply
     }
 }
 
+uuid(c = false) {
+    static n = 0, l, i
+    f := A_FormatInteger, t := A_Now, s := "-"
+    SetFormat, Integer, H
+    t -= 1970, s
+    t := (t . A_MSec) * 10000 + 122192928000000000
+    If !i and c {
+        Loop, HKLM, System\MountedDevices
+            If i := A_LoopRegName
+                Break
+        StringGetPos, c, i, %s%, R2
+        StringMid, i, i, c + 2, 17
+    } Else {
+        Random, x, 0x100, 0xfff
+        Random, y, 0x10000, 0xfffff
+        Random, z, 0x100000, 0xffffff
+        x := 9 . SubStr(x, 3) . s . 1 . SubStr(y, 3) . SubStr(z, 3)
+    } t += n += l = A_Now, l := A_Now
+    SetFormat, Integer, %f%
+    Return, SubStr(t, 10) . s . SubStr(t, 6, 4) . s . 1 . SubStr(t, 3, 3) . s . (c ? i : x)
+}
