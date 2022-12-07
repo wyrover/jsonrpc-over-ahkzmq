@@ -8,7 +8,7 @@ SetWorkingDir, "%A_ScriptDir%"
 #Include LibCon.ahk
 
 global hwnd_main := 0
-global jsonrpc_client
+global jsonrpc_client := new JSONRPCClient()
 global send_message_queue := []
 
 SmartStartConsole()
@@ -25,7 +25,7 @@ start() {
     ; dealer.setsockopt_string(zmq.CURVE_SECRETKEY, "{r]PaKZ%WD.q$VAk=E5jMeFkMkSep.Lk]voT/db+", "utf-8")
 
     dealer.connect("tcp://192.168.79.129:5004")
-    jsonrpc_client := new JSONRPCClient()
+    
     poller := zmq.poller([[dealer, zmq.POLLIN | zmq.POLLOUT]])
 
     loop
@@ -52,10 +52,12 @@ start() {
                 parsed := JSON.Load(msg[A_Index])
                 key := "jsonrpc_" . parsed.id
 
-                reply := jsonrpc_client.replies[key]
+                reply_ptr := jsonrpc_client.replies[key]
+                reply := Object(reply_ptr)
                 if (replay.callback != 0)
                     reply.callback.Call(parsed)
                 jsonrpc_client.replies.Remove(key)
+                ObjRelease(reply_ptr)
             }
 
         }
@@ -88,10 +90,11 @@ return
 CallJsonrpc:
 
     ; 大于10w 就大于 jsonrpc 自增 id 65535
-    loop, 10000 {
-        reply := jsonrpc_client.Send("hello", [42, 23])
+    loop, 1000 {
+        reply_ptr := jsonrpc_client.Send("hello", [42, 23])
         ; 绑定一个回调方法
-        reply.callback := Func("test1")
+        Object(reply_ptr).callback := Func("test1")
+        
     }
 
 return
@@ -132,25 +135,26 @@ class JSONRPCClient
 
         parsed := JSON.Load("{}")
         parsed.jsonrpc := "2.0"
-        parsed.id := ++this.uniqueid
-        ;parsed.id := uuid()
+        ;parsed.id := ++this.uniqueid
+        parsed.id := uuid()
         parsed.method := method
         parsed.params := params
 
         payload := JSON.Dump(parsed)
 
         reply := new Reply(parsed.id, payload)
-
+        reply_ptr := &reply
         key := "jsonrpc_" . parsed.id
-        this.replies.Insert(key, reply)
+        this.replies.Insert(key, reply_ptr)
+        ObjAddRef(reply_ptr)
 
         puts(payload)
 
-        send_message_queue.Push(payload)
+        send_message_queue.Push(payload)      
 
-        ;rc := dealer.send_string(payload, ZMQ.DONTWAIT, "utf-8")
-
-        return reply
+        
+        
+        return reply_ptr
     }
 }
 
